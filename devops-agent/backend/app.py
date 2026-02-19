@@ -12,6 +12,20 @@ from datetime import datetime
 import traceback
 import logging
 
+# Import tools module (with fallback if not available)
+try:
+    from tools import auto_fix_python_file, detect_all_issues, fix_js_file
+    TOOLS_AVAILABLE = True
+except ImportError:
+    logger.warning("tools.py not available - using basic fixes only")
+    TOOLS_AVAILABLE = False
+    def auto_fix_python_file(file_path):
+        return []
+    def detect_all_issues(work_dir, file_path=None):
+        return []
+    def fix_js_file(file_path):
+        return False, "Tools not available"
+
 app = Flask(__name__)
 CORS(app)
 
@@ -449,10 +463,51 @@ def analyze_repository():
         all_passed, test_output, failures = run_tests(work_dir, test_runner)
         logger.info(f"Tests completed. Passed: {all_passed}, Failures: {len(failures)}")
         
-        # Step 5: Generate fixes
+        # Step 5: Generate fixes using automated tools + AI
         jobs[job_id]['status'] = 'fixing'
         jobs[job_id]['progress'] = 70
         fixes = []
+        
+        # Use automated tools if available
+        if TOOLS_AVAILABLE:
+            # First, try automated fixes for linting/style issues
+            python_files = [f for f in test_files if f.endswith('.py')]
+            for py_file in python_files:
+                full_path = os.path.join(work_dir, py_file)
+                if os.path.exists(full_path):
+                    try:
+                        auto_fixes = auto_fix_python_file(full_path)
+                        for fix_msg in auto_fixes:
+                            fixes.append({
+                                'file': py_file,
+                                'bug_type': 'LINTING',
+                                'line': 0,
+                                'fix_description': fix_msg,
+                                'status': 'Fixed',
+                                'tool': 'autopep8/black'
+                            })
+                    except Exception as e:
+                        logger.warning(f"Auto-fix failed for {py_file}: {e}")
+            
+            # Detect all static analysis issues
+            for py_file in python_files:
+                full_path = os.path.join(work_dir, py_file)
+                if os.path.exists(full_path):
+                    try:
+                        static_issues = detect_all_issues(work_dir, full_path)
+                        for issue in static_issues:
+                            fixes.append({
+                                'file': issue.get('file', py_file),
+                                'bug_type': issue.get('type', 'LOGIC'),
+                                'line': issue.get('line', 0),
+                                'fix_description': f"{issue.get('tool', 'tool')}: {issue.get('message', '')}",
+                                'status': 'Detected',
+                                'tool': issue.get('tool', 'unknown')
+                            })
+                    except Exception as e:
+                        logger.warning(f"Static analysis failed for {py_file}: {e}")
+        
+        # Add test failures (these need AI/LLM fixes)
         for failure in failures:
             fix_desc = generate_fix(failure, work_dir)
             fixes.append({
@@ -460,7 +515,8 @@ def analyze_repository():
                 'bug_type': failure['error_type'],
                 'line': failure.get('line', 0),
                 'fix_description': fix_desc,
-                'status': 'pending'
+                'status': 'pending',
+                'tool': 'AI/LLM'
             })
         
         # Step 6: Create branch and commit (optional - don't fail if git ops have permission issues)

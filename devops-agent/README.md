@@ -124,17 +124,39 @@ Branches are created in format: `{REPO_NAME}_AI_Fix`
 
 Example: `MYPROJECT_AI_Fix`
 
+## Real-World Tools Integration
+
+This agent now uses **real automated code fixing tools**:
+
+### Automated Fixes (No AI Needed)
+- **autopep8** - Auto-fixes Python linting issues
+- **black** - Python code formatter
+- **ESLint** - JavaScript/TypeScript linting fixes
+
+### Static Analysis (Detection)
+- **flake8** - Python linting detection
+- **pylint** - Advanced error detection
+- **mypy** - Type error detection
+- **bandit** - Security vulnerability scanning
+
+### AI/LLM (For Logic Bugs Only)
+- Only complex logic bugs and test failures use AI/LLM
+- Reduces costs and improves accuracy
+
+See `INTEGRATION_GUIDE.md` for details.
+
 ## Production Considerations
 
 For production use, you should:
 
-1. **Add AI Integration**: Replace placeholder `generate_fix()` with actual AI/LLM calls (OpenAI GPT, Anthropic Claude, etc.)
-2. **Authentication**: Add GitHub token authentication for private repos
-3. **Security**: Implement rate limiting, input validation, and sandboxing
-4. **Scalability**: Use task queues (Celery, RQ) for async processing
-5. **Database**: Store job history in a database (PostgreSQL, MongoDB)
-6. **Error Handling**: Enhanced error handling and retry logic
-7. **CI/CD Integration**: Connect with GitHub Actions, GitLab CI, etc.
+1. **AI Integration**: Replace placeholder `generate_fix()` with actual AI/LLM calls (OpenAI GPT, Anthropic Claude, etc.)
+2. **Agent Frameworks**: Consider AutoGen or LangGraph for multi-agent orchestration
+3. **Authentication**: Add GitHub token authentication for private repos
+4. **Security**: Implement rate limiting, input validation, and sandboxing
+5. **Scalability**: Use task queues (Celery, RQ) for async processing
+6. **Database**: Store job history in a database (PostgreSQL, MongoDB)
+7. **Error Handling**: Enhanced error handling and retry logic
+8. **CI/CD Integration**: Connect with GitHub Actions, GitLab CI, etc.
 
 ## License
 
