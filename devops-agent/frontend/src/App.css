@@ -245,6 +245,70 @@
   gap: 15px;
 }
 
+.fixes-table-container {
+  overflow-x: auto;
+  margin-top: 20px;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.fixes-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: white;
+  font-size: 0.9em;
+}
+
+.fixes-table thead {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+}
+
+.fixes-table th {
+  padding: 12px;
+  text-align: left;
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.85em;
+  letter-spacing: 0.5px;
+}
+
+.fixes-table td {
+  padding: 12px;
+  border-bottom: 1px solid #e0e0e0;
+  vertical-align: top;
+}
+
+.fixes-table tbody tr:hover {
+  background: #f5f5f5;
+}
+
+.fixes-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.file-cell {
+  font-weight: 600;
+  color: #333;
+  font-family: 'Courier New', monospace;
+  font-size: 0.9em;
+}
+
+.commit-cell {
+  max-width: 300px;
+  word-wrap: break-word;
+  font-size: 0.85em;
+}
+
+.debug-cell {
+  max-width: 200px;
+  word-wrap: break-word;
+  font-size: 0.8em;
+  color: #666;
+  font-family: 'Courier New', monospace;
+  cursor: help;
+}
+
 .fix-item {
   background: #f9f9f9;
   border-left: 4px solid #667eea;
@@ -279,6 +343,8 @@
 .bug-type.indentation { background: #ff5722; color: white; }
 .bug-type.linting { background: #00bcd4; color: white; }
 .bug-type.logic { background: #f44336; color: white; }
+.bug-type.dependency { background: #e91e63; color: white; }
+.bug-type.test_logic { background: #795548; color: white; }
 
 .fix-file {
   font-weight: 600;

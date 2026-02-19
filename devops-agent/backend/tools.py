@@ -40,20 +40,23 @@ def run_black(file_path):
         return False, str(e)
 
 def run_flake8(file_path):
-    """Run flake8 to detect linting issues"""
+    """Run flake8 to detect linting issues (parse default text output)"""
     try:
         result = subprocess.run(
-            ['flake8', '--format=json', file_path],
+            ['flake8', file_path],
             capture_output=True,
             text=True,
             timeout=30
         )
-        # flake8 returns non-zero if issues found, but that's OK
-        import json
-        try:
-            issues = json.loads(result.stdout) if result.stdout else []
-        except:
-            issues = []
+        # flake8 outputs: file:line:col: code message
+        issues = []
+        for line in (result.stdout or '').splitlines():
+            parts = line.split(':', 3)
+            if len(parts) >= 4:
+                issues.append({
+                    'line_number': int(parts[1]) if parts[1].isdigit() else 0,
+                    'text': parts[3].strip()
+                })
         return issues, result.stderr
     except FileNotFoundError:
         return [], "flake8 not installed"
@@ -61,7 +64,7 @@ def run_flake8(file_path):
         return [], str(e)
 
 def run_pylint(file_path):
-    """Run pylint to detect errors and warnings"""
+    """Run pylint to detect errors and warnings (one JSON object per line)"""
     try:
         result = subprocess.run(
             ['pylint', '--output-format=json', file_path],
@@ -70,10 +73,14 @@ def run_pylint(file_path):
             timeout=60
         )
         import json
-        try:
-            issues = json.loads(result.stdout) if result.stdout else []
-        except:
-            issues = []
+        issues = []
+        for line in (result.stdout or '').strip().splitlines():
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    issues.append(obj)
+            except (json.JSONDecodeError, TypeError):
+                pass
         return issues, result.stderr
     except FileNotFoundError:
         return [], "pylint not installed"
@@ -122,15 +129,20 @@ def run_bandit(file_path):
         return [], str(e)
 
 def auto_fix_python_file(file_path):
-    """Automatically fix Python file using autopep8 and black"""
+    """Automatically fix Python file - use black only (autopep8 needs lib2to3, removed in Python 3.12+)"""
     fixes_applied = []
     
-    # Run autopep8 first (fixes linting issues)
-    success, output = run_autopep8(file_path)
-    if success:
-        fixes_applied.append("autopep8: Fixed linting issues")
-    else:
-        logger.warning(f"autopep8 failed: {output}")
+    # Skip autopep8 on Python 3.12+ (lib2to3 removed) - use black only
+    try:
+        import sys
+        if sys.version_info < (3, 12):
+            success, output = run_autopep8(file_path)
+            if success:
+                fixes_applied.append("autopep8: Fixed linting issues")
+            else:
+                logger.warning(f"autopep8 failed: {output}")
+    except Exception as e:
+        logger.warning(f"autopep8 skipped: {e}")
     
     # Run black (formats code)
     success, output = run_black(file_path)
@@ -152,42 +164,47 @@ def detect_all_issues(work_dir, file_path=None):
         mypy_issues, _ = run_mypy(file_path)
         bandit_issues, _ = run_bandit(file_path)
         
-        # Classify and add issues
-        for issue in flake8_issues:
-            all_issues.append({
-                'file': file_path,
-                'line': issue.get('line_number', 0),
-                'type': 'LINTING',
-                'message': issue.get('text', ''),
-                'tool': 'flake8'
-            })
+        # Classify and add issues (handle various output formats)
+        for issue in (flake8_issues if isinstance(flake8_issues, list) else []):
+            if isinstance(issue, dict):
+                all_issues.append({
+                    'file': file_path,
+                    'line': issue.get('line_number', issue.get('line', 0)),
+                    'type': 'LINTING',
+                    'message': issue.get('text', issue.get('message', str(issue))),
+                    'tool': 'flake8'
+                })
         
-        for issue in pylint_issues:
-            all_issues.append({
-                'file': file_path,
-                'line': issue.get('line', 0),
-                'type': classify_pylint_message(issue.get('message', {})),
-                'message': issue.get('message', {}).get('message', ''),
-                'tool': 'pylint'
-            })
+        for issue in (pylint_issues if isinstance(pylint_issues, list) else []):
+            if isinstance(issue, dict):
+                msg = issue.get('message', {})
+                msg_text = msg.get('message', str(msg)) if isinstance(msg, dict) else str(msg)
+                all_issues.append({
+                    'file': file_path,
+                    'line': issue.get('line', 0),
+                    'type': classify_pylint_message(msg) if isinstance(msg, dict) else 'LOGIC',
+                    'message': msg_text,
+                    'tool': 'pylint'
+                })
         
-        for error in mypy_issues:
+        for error in (mypy_issues if isinstance(mypy_issues, list) else []):
             all_issues.append({
                 'file': file_path,
-                'line': 0,  # mypy doesn't always provide line numbers
+                'line': 0,
                 'type': 'TYPE_ERROR',
-                'message': error,
+                'message': str(error),
                 'tool': 'mypy'
             })
         
-        for issue in bandit_issues:
-            all_issues.append({
-                'file': file_path,
-                'line': issue.get('line_number', 0),
-                'type': 'SECURITY',
-                'message': issue.get('issue_text', ''),
-                'tool': 'bandit'
-            })
+        for issue in (bandit_issues if isinstance(bandit_issues, list) else []):
+            if isinstance(issue, dict):
+                all_issues.append({
+                    'file': file_path,
+                    'line': issue.get('line_number', 0),
+                    'type': 'SECURITY',
+                    'message': issue.get('issue_text', str(issue)),
+                    'tool': 'bandit'
+                })
     
     return all_issues
 

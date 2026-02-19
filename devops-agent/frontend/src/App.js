@@ -153,6 +153,12 @@ function App() {
                   <h3>Branch</h3>
                   <p>{results.branch || 'N/A'}</p>
                 </div>
+                {results.team_leader && (
+                  <div className="card">
+                    <h3>Team Leader</h3>
+                    <p>{results.team_leader}</p>
+                  </div>
+                )}
                 <div className="card">
                   <h3>Status</h3>
                   <p className={results.final_status === 'PASSED' ? 'status-passed' : 'status-failed'}>
@@ -186,23 +192,44 @@ function App() {
 
               {results.fixes && results.fixes.length > 0 && (
                 <div className="fixes-section">
-                  <h3>🔧 Fixes Applied</h3>
-                  <div className="fixes-list">
-                    {results.fixes.map((fix, idx) => (
-                      <div key={idx} className="fix-item">
-                        <div className="fix-header">
-                          <span className={`bug-type ${(fix.bug_type || 'LOGIC').toLowerCase()}`}>
-                            {fix.bug_type || 'LOGIC'}
-                          </span>
-                          <span className="fix-file">{fix.file || 'unknown'}</span>
-                          {fix.line && <span className="fix-line">Line {fix.line}</span>}
-                        </div>
-                        <p className="fix-description">{fix.fix_description || 'No description'}</p>
-                        <span className={`fix-status ${(fix.status || 'pending').toLowerCase()}`}>
-                          {fix.status || 'pending'}
-                        </span>
-                      </div>
-                    ))}
+                  <h3>🔧 Errors Detected & Fixes Applied</h3>
+                  <div className="fixes-table-container">
+                    <table className="fixes-table">
+                      <thead>
+                        <tr>
+                          <th>File</th>
+                          <th>Bug Type</th>
+                          <th>Line</th>
+                          <th>Commit Message</th>
+                          <th>AI Providers</th>
+                          <th>Status</th>
+                          <th>Debug</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {results.fixes.map((fix, idx) => (
+                          <tr key={idx}>
+                            <td className="file-cell">{fix.file || 'unknown'}</td>
+                            <td>
+                              <span className={`bug-type ${(fix.bug_type || 'LOGIC').toLowerCase()}`}>
+                                {fix.bug_type || 'LOGIC'}
+                              </span>
+                            </td>
+                            <td>{fix.line || '-'}</td>
+                            <td className="commit-cell">{fix.commit_message || fix.fix_description || '-'}</td>
+                            <td>{fix.ai_provider || 'AI/LLM'}</td>
+                            <td>
+                              <span className={`fix-status ${(fix.status || 'pending').toLowerCase()}`}>
+                                {fix.status || 'Pending'}
+                              </span>
+                            </td>
+                            <td className="debug-cell" title={fix.debug || ''}>
+                              {fix.debug ? (fix.debug.length > 50 ? fix.debug.substring(0, 50) + '...' : fix.debug) : '-'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
                 </div>
               )}

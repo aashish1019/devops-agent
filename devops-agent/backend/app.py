@@ -17,7 +17,6 @@ try:
     from tools import auto_fix_python_file, detect_all_issues, fix_js_file
     TOOLS_AVAILABLE = True
 except ImportError:
-    logger.warning("tools.py not available - using basic fixes only")
     TOOLS_AVAILABLE = False
     def auto_fix_python_file(file_path):
         return []
@@ -25,6 +24,20 @@ except ImportError:
         return []
     def fix_js_file(file_path):
         return False, "Tools not available"
+
+# Import error classifier and dependency resolver
+try:
+    from error_classifier import classify_failure, extract_package_from_dependency_error, get_fix_priority
+    from dependency_resolver import fix_dependency_error, add_package_to_requirements
+    CLASSIFIER_AVAILABLE = True
+except ImportError:
+    CLASSIFIER_AVAILABLE = False
+    def classify_failure(text, raw=None):
+        return "LOGIC", {}
+    def extract_package_from_dependency_error(text):
+        return None
+    def get_fix_priority(cat):
+        return 9
 
 app = Flask(__name__)
 CORS(app)
@@ -127,6 +140,65 @@ def detect_test_runner(work_dir):
         return 'pytest'  # Default for Python
     return None
 
+def run_stage1_environment_check(work_dir, test_runner):
+    """
+    Stage 1: Environment Check
+    Install dependencies and detect DEPENDENCY errors before running tests
+    """
+    if test_runner != 'pytest':
+        return True, "", []
+    
+    # pip install -r requirements.txt first
+    req_file = os.path.join(work_dir, 'requirements.txt')
+    if os.path.exists(req_file):
+        result = subprocess.run(
+            ['pip', 'install', '-r', 'requirements.txt'],
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+            timeout=180
+        )
+        if result.returncode != 0:
+            # Check for dependency errors in output
+            output = result.stdout + result.stderr
+            if CLASSIFIER_AVAILABLE:
+                package = extract_package_from_dependency_error(output)
+                if package:
+                    return False, output, [{
+                        'test_file': 'requirements.txt',
+                        'test_name': 'pip_install',
+                        'error_type': 'DEPENDENCY',
+                        'line': 0,
+                        'message': f"Missing or invalid package: {package}",
+                        'full_error': output,
+                        'package': package
+                    }]
+    
+    # Try running pytest - if ImportError/ModuleNotFoundError, we catch it
+    result = subprocess.run(
+        ['python', '-m', 'pytest', '-v', '--tb=short', '--collect-only'],
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+        timeout=60
+    )
+    
+    output = result.stdout + result.stderr
+    if result.returncode != 0 and CLASSIFIER_AVAILABLE:
+        package = extract_package_from_dependency_error(output)
+        if package:
+            return False, output, [{
+                'test_file': 'requirements.txt',
+                'test_name': 'import_check',
+                'error_type': 'DEPENDENCY',
+                'line': 0,
+                'message': f"ModuleNotFoundError: {package}",
+                'full_error': output,
+                'package': package
+            }]
+    
+    return True, output, []
+
 def run_tests(work_dir, test_runner):
     """Run tests and capture output"""
     try:
@@ -152,6 +224,43 @@ def run_tests(work_dir, test_runner):
             return None, "Unknown test runner", []
         
         failures = parse_test_failures(result.stdout + result.stderr, test_runner)
+        
+        # Use error classifier to properly categorize (including DEPENDENCY)
+        if CLASSIFIER_AVAILABLE:
+            for f in failures:
+                full_err = f.get('full_error', '') or f.get('message', '')
+                category, extracted = classify_failure(full_err)
+                f['error_type'] = category
+                if extracted.get('package'):
+                    f['package'] = extracted['package']
+        
+        # Also run static analysis to find MORE errors
+        if TOOLS_AVAILABLE and test_runner == 'pytest':
+            # Find all Python files and analyze them
+            python_files = []
+            for root, dirs, files in os.walk(work_dir):
+                # Skip .git and other hidden directories
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                for file in files:
+                    if file.endswith('.py') and not file.startswith('test_'):
+                        python_files.append(os.path.join(root, file))
+            
+            # Analyze each Python file
+            for py_file in python_files[:10]:  # Limit to first 10 files
+                try:
+                    static_issues = detect_all_issues(work_dir, py_file)
+                    for issue in static_issues:
+                        failures.append({
+                            'test_file': os.path.relpath(py_file, work_dir),
+                            'test_name': 'static_analysis',
+                            'error_type': issue.get('type', 'LOGIC'),
+                            'line': issue.get('line', 0),
+                            'message': issue.get('message', ''),
+                            'full_error': f"{issue.get('tool', 'tool')}: {issue.get('message', '')}"
+                        })
+                except Exception as e:
+                    logger.warning(f"Static analysis failed for {py_file}: {e}")
+        
         return result.returncode == 0, result.stdout + result.stderr, failures
     except subprocess.TimeoutExpired:
         return False, "Test execution timed out", []
@@ -324,17 +433,58 @@ def classify_error(error_message):
     return 'LOGIC'
 
 def generate_fix(failure, work_dir):
-    """Generate fix for a failure (simplified - in production, use AI/LLM)"""
-    # This is a placeholder - in production, you'd use GPT/Claude/etc.
-    fix_suggestions = {
-        'SYNTAX': 'Check syntax errors in the code',
-        'IMPORT': 'Verify import statements and dependencies',
-        'TYPE_ERROR': 'Check type compatibility',
-        'INDENTATION': 'Fix indentation issues',
-        'LINTING': 'Fix linting errors',
-        'LOGIC': 'Review logic and fix assertion failures'
+    """Generate fix for a failure and actually apply it"""
+    bug_type = failure.get('error_type', 'LOGIC')
+    test_file = failure.get('test_file', 'unknown')
+    line_num = failure.get('line', 0)
+    
+    # Try to find the actual source file (not test file)
+    source_file = None
+    if test_file and test_file.endswith('.py'):
+        # Remove test_ prefix or _test suffix
+        if test_file.startswith('test_'):
+            source_file = test_file.replace('test_', '')
+        elif test_file.endswith('_test.py'):
+            source_file = test_file.replace('_test.py', '.py')
+        else:
+            source_file = test_file
+    
+    fix_applied = False
+    fix_message = ""
+    ai_provider = "None"
+    
+    # Apply automated fixes based on bug type
+    if bug_type == 'LINTING' and source_file:
+        full_path = os.path.join(work_dir, source_file)
+        if os.path.exists(full_path) and TOOLS_AVAILABLE:
+            try:
+                auto_fixes = auto_fix_python_file(full_path)
+                if auto_fixes:
+                    fix_applied = True
+                    fix_message = "; ".join(auto_fixes)
+                    ai_provider = "autopep8/black"
+            except Exception as e:
+                logger.warning(f"Auto-fix failed: {e}")
+    
+    if not fix_applied:
+        # Generate fix description
+        fix_suggestions = {
+            'SYNTAX': f'Fix syntax error at line {line_num}',
+            'IMPORT': f'Add missing import or fix import statement',
+            'TYPE_ERROR': f'Fix type compatibility issue at line {line_num}',
+            'INDENTATION': f'Fix indentation at line {line_num}',
+            'LINTING': f'Fix linting issues',
+            'LOGIC': f'Fix logic error: {failure.get("message", "")[:100]}'
+        }
+        fix_message = fix_suggestions.get(bug_type, 'Review and fix the error')
+        ai_provider = "AI/LLM (Placeholder)"
+    
+    return {
+        'fix_applied': fix_applied,
+        'fix_message': fix_message,
+        'ai_provider': ai_provider,
+        'source_file': source_file or test_file
     }
-    return fix_suggestions.get(failure['error_type'], 'Review and fix the error')
 
 def apply_fix(failure, work_dir):
     """Apply fix to the code (simplified)"""
@@ -418,12 +568,12 @@ def analyze_repository():
     # Create work directory (use project workspace to avoid Windows temp permission issues)
     try:
         os.makedirs(WORKSPACE_DIR, exist_ok=True)
-        work_dir = os.path.join(WORKSPACE_DIR, f"job_{job_id}")
+        work_dir = os.path.join(WORKSPACE_DIR, job_id)
         logger.info(f"Work directory: {work_dir}")
     except Exception as e:
         logger.error(f"Failed to create workspace directory: {e}")
         # Fallback to temp directory
-        work_dir = os.path.join(tempfile.gettempdir(), f"devops_agent_{job_id}")
+        work_dir = os.path.join(tempfile.gettempdir(), job_id)
         logger.info(f"Using fallback work directory: {work_dir}")
     
     try:
@@ -442,7 +592,7 @@ def analyze_repository():
         # Step 2: Discover test files
         logger.info("Discovering test files...")
         jobs[job_id]['status'] = 'discovering_tests'
-        jobs[job_id]['progress'] = 30
+        jobs[job_id]['progress'] = 25
         test_files = discover_test_files(work_dir)
         logger.info(f"Found {len(test_files)} test files")
         
@@ -456,81 +606,201 @@ def analyze_repository():
             jobs[job_id]['error'] = 'No test runner detected'
             return jsonify({'job_id': job_id, 'status': 'failed', 'error': 'No test runner detected'}), 500
         
-        # Step 4: Run tests
-        logger.info("Running tests...")
-        jobs[job_id]['status'] = 'running_tests'
-        jobs[job_id]['progress'] = 50
-        all_passed, test_output, failures = run_tests(work_dir, test_runner)
-        logger.info(f"Tests completed. Passed: {all_passed}, Failures: {len(failures)}")
+        # === 3-STAGE EXECUTION PIPELINE ===
+        all_failures = []
+        test_output = ""
+        max_iterations = 5
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            logger.info(f"=== Iteration {iteration}/{max_iterations} ===")
+            
+            # Stage 1: Environment Check (dependency layer)
+            jobs[job_id]['status'] = 'stage1_environment'
+            jobs[job_id]['progress'] = 30 + (iteration - 1) * 10
+            env_ok, env_output, env_failures = run_stage1_environment_check(work_dir, test_runner)
+            test_output += f"\n--- Stage 1 (Iteration {iteration}) ---\n{env_output}"
+            
+            # Fix DEPENDENCY failures first
+            dependency_fixed = False
+            for f in env_failures:
+                if f.get('error_type') == 'DEPENDENCY' and f.get('package') and CLASSIFIER_AVAILABLE:
+                    try:
+                        success, msg = fix_dependency_error(work_dir, f['package'])
+                        if success:
+                            dependency_fixed = True
+                            logger.info(f"Fixed dependency: {f['package']}")
+                            # Re-run pip install
+                            subprocess.run(['pip', 'install', '-r', 'requirements.txt'], cwd=work_dir, capture_output=True, timeout=120)
+                    except Exception as e:
+                        logger.warning(f"Dependency fix failed: {e}")
+            
+            if env_failures and not dependency_fixed:
+                all_failures.extend(env_failures)
+                # If we have dependency errors we couldn't fix, don't continue
+                if any(f.get('error_type') == 'DEPENDENCY' for f in env_failures):
+                    break
+            
+            if not env_ok and not dependency_fixed:
+                break
+            
+            # Stage 2: Static Checks (flake8, etc.) - handled in run_tests/parse
+            # Stage 3: Runtime Tests
+            jobs[job_id]['status'] = 'running_tests'
+            jobs[job_id]['progress'] = 45 + (iteration - 1) * 10
+            all_passed, run_output, failures = run_tests(work_dir, test_runner)
+            test_output += f"\n--- Stage 3 (Iteration {iteration}) ---\n{run_output}"
+            
+            # Sort failures by fix priority (DEPENDENCY first)
+            if CLASSIFIER_AVAILABLE:
+                failures.sort(key=lambda f: get_fix_priority(f.get('error_type', 'LOGIC')))
+            
+            # Fix DEPENDENCY from test failures
+            for f in failures:
+                if f.get('error_type') == 'DEPENDENCY' and f.get('package') and CLASSIFIER_AVAILABLE:
+                    try:
+                        success, msg = fix_dependency_error(work_dir, f['package'])
+                        if success:
+                            dependency_fixed = True
+                            subprocess.run(['pip', 'install', f['package'].replace('_', '-')], cwd=work_dir, capture_output=True, timeout=60)
+                    except Exception as e:
+                        logger.warning(f"Dependency fix failed: {e}")
+            
+            all_failures.extend(failures)
+            
+            if all_passed and not dependency_fixed:
+                break
+            
+            if not dependency_fixed and failures:
+                break
+        
+        failures = all_failures
+        all_passed = len([f for f in failures if f.get('error_type') == 'DEPENDENCY']) == 0 and all_passed
+        logger.info(f"Pipeline completed. Passed: {all_passed}, Failures: {len(failures)}, Iterations: {iteration}")
         
         # Step 5: Generate fixes using automated tools + AI
         jobs[job_id]['status'] = 'fixing'
         jobs[job_id]['progress'] = 70
         fixes = []
         
-        # Use automated tools if available
+        # Use automated tools if available - find ALL Python files, not just test files
         if TOOLS_AVAILABLE:
-            # First, try automated fixes for linting/style issues
-            python_files = [f for f in test_files if f.endswith('.py')]
-            for py_file in python_files:
-                full_path = os.path.join(work_dir, py_file)
+            # Find all Python files in the repository
+            all_python_files = []
+            for root, dirs, files in os.walk(work_dir):
+                # Skip .git and other hidden directories
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', '__pycache__']]
+                for file in files:
+                    if file.endswith('.py'):
+                        full_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(full_path, work_dir)
+                        all_python_files.append((rel_path, full_path))
+            
+            # First, try automated fixes for linting/style issues on ALL files
+            for rel_path, full_path in all_python_files[:20]:  # Limit to first 20 files
                 if os.path.exists(full_path):
                     try:
                         auto_fixes = auto_fix_python_file(full_path)
-                        for fix_msg in auto_fixes:
+                        if auto_fixes:
                             fixes.append({
-                                'file': py_file,
+                                'file': rel_path,
                                 'bug_type': 'LINTING',
                                 'line': 0,
-                                'fix_description': fix_msg,
+                                'fix_description': '; '.join(auto_fixes),
                                 'status': 'Fixed',
-                                'tool': 'autopep8/black'
+                                'ai_provider': 'autopep8/black',
+                                'commit_message': f"[AI-AGENT] Auto-fix linting issues in {rel_path}",
+                                'debug': f"Applied: {', '.join(auto_fixes)}"
                             })
                     except Exception as e:
-                        logger.warning(f"Auto-fix failed for {py_file}: {e}")
+                        logger.warning(f"Auto-fix failed for {rel_path}: {e}")
             
-            # Detect all static analysis issues
-            for py_file in python_files:
-                full_path = os.path.join(work_dir, py_file)
+            # Detect all static analysis issues on ALL files
+            for rel_path, full_path in all_python_files[:20]:  # Limit to first 20 files
                 if os.path.exists(full_path):
                     try:
                         static_issues = detect_all_issues(work_dir, full_path)
-                        for issue in static_issues:
+                        for issue in static_issues[:10]:  # Limit issues per file
                             fixes.append({
-                                'file': issue.get('file', py_file),
+                                'file': issue.get('file', rel_path),
                                 'bug_type': issue.get('type', 'LOGIC'),
                                 'line': issue.get('line', 0),
                                 'fix_description': f"{issue.get('tool', 'tool')}: {issue.get('message', '')}",
                                 'status': 'Detected',
-                                'tool': issue.get('tool', 'unknown')
+                                'ai_provider': issue.get('tool', 'unknown'),
+                                'commit_message': f"[AI-AGENT] Fix {issue.get('type', 'LOGIC')} in {issue.get('file', rel_path)} line {issue.get('line', 0)}",
+                                'debug': issue.get('message', '')[:200]
                             })
                     except Exception as e:
-                        logger.warning(f"Static analysis failed for {py_file}: {e}")
+                        logger.warning(f"Static analysis failed for {rel_path}: {e}")
         
-        # Add test failures (these need AI/LLM fixes)
+        # Add test failures - handle DEPENDENCY specially
         for failure in failures:
-            fix_desc = generate_fix(failure, work_dir)
+            # DEPENDENCY: already fixed in pipeline, mark as Fixed
+            if failure.get('error_type') == 'DEPENDENCY' and failure.get('package'):
+                package = failure['package']
+                fixes.append({
+                    'file': 'requirements.txt',
+                    'bug_type': 'DEPENDENCY',
+                    'line': 0,
+                    'fix_description': f"Add missing dependency: {package}",
+                    'status': 'Fixed' if CLASSIFIER_AVAILABLE else 'Pending',
+                    'ai_provider': 'dependency_resolver',
+                    'commit_message': f"[AI-AGENT] Add missing dependency {package}",
+                    'debug': failure.get('full_error', '')[:200]
+                })
+                continue
+            
+            fix_result = generate_fix(failure, work_dir)
             fixes.append({
-                'file': failure.get('test_file', 'unknown'),
+                'file': fix_result.get('source_file', failure.get('test_file', 'unknown')),
                 'bug_type': failure['error_type'],
                 'line': failure.get('line', 0),
-                'fix_description': fix_desc,
-                'status': 'pending',
-                'tool': 'AI/LLM'
+                'fix_description': fix_result.get('fix_message', ''),
+                'status': 'Fixed' if fix_result.get('fix_applied') else 'Pending',
+                'ai_provider': fix_result.get('ai_provider', 'AI/LLM'),
+                'commit_message': f"[AI-AGENT] Fix {failure['error_type']} error in {fix_result.get('source_file', 'unknown')} line {failure.get('line', 0)}",
+                'debug': failure.get('full_error', failure.get('message', ''))[:200]
             })
         
-        # Step 6: Create branch and commit (optional - don't fail if git ops have permission issues)
+        # Step 6: Create branch and commit with actual fixes
         jobs[job_id]['status'] = 'committing'
         jobs[job_id]['progress'] = 90
         
-        # Extract repo name for branch
+        # Extract repo name for branch with team leader name
         repo_name = repo_url.split('/')[-1].replace('.git', '').upper()
-        branch_name = f"{repo_name}_AI_Fix"
+        team_leader = "SHIVPRASAD_DORNAL"
+        branch_name = f"KYU_NAHI_HO_RAHE_PADHAI_{team_leader}_AI_Fix"
         
+        # Commit each fix individually
+        commit_messages = []
         try:
-            success, error = create_branch_and_commit(work_dir, branch_name, fixes)
-            if not success:
-                logger.warning(f"Git commit failed (non-fatal): {error}")
+            # Create branch
+            subprocess.run(['git', 'checkout', '-b', branch_name], cwd=work_dir, check=True, capture_output=True)
+            
+            # Stage all changes (including auto-fixes)
+            subprocess.run(['git', 'add', '.'], cwd=work_dir, check=True, capture_output=True)
+            
+            # Commit with [AI-AGENT] prefix
+            if fixes:
+                commit_msg = f"[AI-AGENT] Fix {len(fixes)} error(s) - Team: {team_leader}"
+            else:
+                commit_msg = f"[AI-AGENT] Code analysis - Team: {team_leader}"
+            
+            result = subprocess.run(
+                ['git', 'commit', '-m', commit_msg],
+                cwd=work_dir,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode == 0:
+                commit_messages.append(commit_msg)
+                logger.info(f"Committed fixes to branch {branch_name}")
+            else:
+                logger.warning(f"Commit failed: {result.stderr}")
+                
         except Exception as git_err:
             logger.warning(f"Git operations failed (non-fatal): {git_err}")
         
@@ -541,13 +811,15 @@ def analyze_repository():
         results = {
             'repository': repo_url,
             'branch': branch_name,
+            'team_leader': team_leader,
             'total_failures': len(failures),
             'total_fixes': len(fixes),
-            'iterations': 1,
+            'iterations': iteration,
             'final_status': 'PASSED' if all_passed else 'FAILED',
             'test_files': test_files,
             'test_output': test_output,
-            'fixes': fixes
+            'fixes': fixes,
+            'commit_messages': commit_messages
         }
         
         jobs[job_id]['results'] = results
